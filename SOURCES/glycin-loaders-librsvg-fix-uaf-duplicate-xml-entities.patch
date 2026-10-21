@@ -1,0 +1,108 @@
+Backport of the fix for a use-after-free with duplicate XML entities in the
+bundled copy of librsvg.
+
+Upstream fix:
+  https://gitlab.gnome.org/GNOME/librsvg/-/merge_requests/1222
+  commit 1606574427408baca8203ef723281509a229f9e2
+  "(#1241): Fix use-after-free with duplicate XML entities"
+  Fixes https://gitlab.gnome.org/GNOME/librsvg/-/work_items/1241
+
+When an included XML document declares an entity whose name duplicates an
+already-declared one, librsvg freed the old xmlEntityPtr while libxml2 still
+held and used pointers to it. The fix ignores entity declarations whose name
+is already present. Entity creation is moved into XmlState::entity_insert so
+the duplicate is never even created.
+
+Adapted to the bundled librsvg 2.58.0: upstream was written against 2.60,
+whose entity HashMap stores an XmlEntity Drop wrapper. In 2.58 the HashMap
+stores raw XmlEntityPtr values that are freed explicitly (in entity_insert on
+replace, and in build_document on teardown), so the duplicate-free happened in
+entity_insert directly rather than via Drop. The backport keeps 2.58's raw
+pointer storage and only applies the behavioural change (skip duplicates).
+
+--- a/vendor/librsvg/src/xml/mod.rs
++++ b/vendor/librsvg/src/xml/mod.rs
+@@ -10,7 +10,8 @@
+     expanded_name, local_name, namespace_url, ns, ExpandedName, LocalName, Namespace, QualName,
+ };
+ use std::cell::RefCell;
+-use std::collections::HashMap;
++use std::collections::{hash_map::Entry, HashMap};
++use std::ptr;
+ use std::rc::Rc;
+ use std::str;
+ use std::string::ToString;
+@@ -31,6 +32,7 @@
+ use crate::style::StyleType;
+ use crate::url_resolver::AllowedUrl;
+ 
++use xml2::xmlNewEntity;
+ use xml2_load::Xml2Parser;
+ 
+ mod attributes;
+@@ -341,15 +343,34 @@
+         self.inner.borrow().entities.get(entity_name).copied()
+     }
+ 
+-    pub fn entity_insert(&self, entity_name: &str, entity: XmlEntityPtr) {
++    pub fn entity_insert(
++        &self,
++        entity_name: &str,
++        xml_entity_name: *const libc::c_char,
++        type_: libc::c_int,
++        content: *const libc::c_char,
++    ) {
+         let mut inner = self.inner.borrow_mut();
+ 
+-        let old_value = inner.entities.insert(entity_name.to_string(), entity);
+-
+-        if let Some(v) = old_value {
+-            unsafe {
+-                xmlFreeNode(v);
++        match inner.entities.entry(entity_name.to_string()) {
++            Entry::Occupied(_) => {
++                // Ignore the case where an entity is declared twice with the
++                // same name.
+             }
++
++            Entry::Vacant(v) => unsafe {
++                let entity = xmlNewEntity(
++                    ptr::null_mut(),
++                    xml_entity_name,
++                    type_,
++                    ptr::null(),
++                    ptr::null(),
++                    content,
++                );
++                assert!(!entity.is_null());
++
++                v.insert(entity);
++            },
+         }
+     }
+ 
+--- a/vendor/librsvg/src/xml/xml2_load.rs
++++ b/vendor/librsvg/src/xml/xml2_load.rs
+@@ -149,18 +149,10 @@
+         return;
+     }
+ 
+-    let entity = xmlNewEntity(
+-        ptr::null_mut(),
+-        name,
+-        type_,
+-        ptr::null(),
+-        ptr::null(),
+-        content,
+-    );
+-    assert!(!entity.is_null());
+-
+-    let name = utf8_cstr(name);
+-    xml2_parser.state.entity_insert(name, entity);
++    let str_name = utf8_cstr(name);
++    xml2_parser
++        .state
++        .entity_insert(str_name, name, type_, content);
+ }
+ 
+ unsafe extern "C" fn sax_unparsed_entity_decl_cb(
